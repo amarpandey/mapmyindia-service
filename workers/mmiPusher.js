@@ -151,6 +151,7 @@ function open() {
     }
 
     const payload = buildPayload(doc);
+    console.log(`[mmi-pusher] IMEI=${imei} push body: ${JSON.stringify(payload)}`);
 
     pushToMMI(imei, payload).catch(err =>
       console.error(`[mmi-pusher] Unexpected error for IMEI=${imei}:`, err.message)
