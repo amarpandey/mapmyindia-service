@@ -1,24 +1,4 @@
 'use strict';
-/**
- * MapMyIndia (Mappls) IoT Push worker.
- *
- * Watches the `ais140locations` MongoDB collection via a Change Stream and
- * forwards every valid GPS position to the Mappls GPS Push API in real time.
- *
- *   POST https://intouch.mapmyindia.com/iot/api/events/pushData/
- *
- * Protocol reference: protocols/GPS_API_Documentation.docx § 3
- *
- * Behaviour:
- *   • Only packets with a valid GPS fix (gpsValid=true, lat/lng present) are pushed.
- *   • Packets without coordinates (HBT, LGN with no fix, etc.) are silently skipped.
- *   • On HTTP 401 the token is invalidated and the push is retried once.
- *   • On HTTP 403 the IMEI is added to a transient skip-set (cleared on restart).
- *   • On HTTP 429 a warning is logged; the record is not retried.
- *   • Change-stream errors trigger an automatic 5-second reconnect loop.
- *
- * Requires: MongoDB replica-set mode (or Atlas) for change streams.
- */
 
 const axios                         = require('axios');
 const mongoose                      = require('mongoose');
@@ -29,7 +9,15 @@ const PUSH_URL = 'https://intouch.mapmyindia.com/iot/api/events/pushData/';
 // IMEIs that returned 403 — skip for the process lifetime (not registered on Mappls)
 const _skipImeis = new Set();
 
-let _stream = null;
+let _stream        = null;
+let _reconnecting  = false;   // guard against duplicate reconnect timers
+let _lastEventAt   = Date.now();
+let _activeOps     = 0;       // count of in-flight pushToMMI calls
+let _watchdogTimer = null;
+
+const MAX_CONCURRENT_PUSH = 20;  // drop events if more than this many are in-flight
+const WATCHDOG_INTERVAL   = 5 * 60 * 1_000;  // check every 5 min
+const STALE_STREAM_MS     = 15 * 60 * 1_000; // treat stream as dead after 15 min silence
 
 // ── Payload mapper ────────────────────────────────────────────────────────────
 
@@ -71,61 +59,114 @@ function buildPayload(doc) {
 // ── HTTP push (with one retry on 401) ─────────────────────────────────────────
 
 async function pushToMMI(imei, payload) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const token = await getToken();
+  _activeOps++;
+  try {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const token = await getToken();
 
-    let res;
-    try {
-      res = await axios.post(PUSH_URL, payload, {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'trackingCode':  imei,
-          'Content-Type':  'application/json',
-          'Cookie':        'HttpOnly',
-        },
-        timeout:        10_000,
-        validateStatus: () => true,
-      });
-    } catch (err) {
-      console.error(`[mmi-pusher] IMEI=${imei} network error: ${err.message}`);
-      return;
-    }
+      let res;
+      try {
+        res = await axios.post(PUSH_URL, payload, {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'trackingCode':  imei,
+            'Content-Type':  'application/json',
+            'Cookie':        'HttpOnly',
+          },
+          timeout:        10_000,
+          validateStatus: () => true,
+        });
+      } catch (err) {
+        console.error(`[mmi-pusher] IMEI=${imei} network error: ${err.message}`);
+        return;
+      }
 
-    if (res.status >= 200 && res.status < 300) {
-      console.log(`[mmi-pusher] ✓ IMEI=${imei} → HTTP ${res.status}`);
-      return;
-    }
+      if (res.status >= 200 && res.status < 300) {
+        console.log(`[mmi-pusher] ✓ IMEI=${imei} → HTTP ${res.status}`);
+        return;
+      }
 
-    if (res.status === 401 && attempt === 1) {
-      console.warn(`[mmi-pusher] IMEI=${imei} → 401 stale token — refreshing and retrying…`);
-      invalidateToken();
-      continue;
-    }
+      if (res.status === 401 && attempt === 1) {
+        console.warn(`[mmi-pusher] IMEI=${imei} → 401 stale token — refreshing and retrying…`);
+        invalidateToken();
+        continue;
+      }
 
-    if (res.status === 403) {
-      _skipImeis.add(imei);
+      if (res.status === 403) {
+        _skipImeis.add(imei);
+        console.warn(
+          `[mmi-pusher] IMEI=${imei} → 403 Forbidden. ` +
+          `IMEI may not be registered on Mappls — skipping for this session.`
+        );
+        return;
+      }
+
+      if (res.status === 429) {
+        console.warn(`[mmi-pusher] IMEI=${imei} → 429 Too Many Requests — reduce push rate.`);
+        return;
+      }
+
       console.warn(
-        `[mmi-pusher] IMEI=${imei} → 403 Forbidden. ` +
-        `IMEI may not be registered on Mappls — skipping for this session.`
+        `[mmi-pusher] IMEI=${imei} → HTTP ${res.status}: ${JSON.stringify(res.data)}`
       );
       return;
     }
+  } finally {
+    _activeOps--;
+  }
+}
 
-    if (res.status === 429) {
-      console.warn(`[mmi-pusher] IMEI=${imei} → 429 Too Many Requests — reduce push rate.`);
+// ── Watchdog: detects a silently-dead change stream and forces reconnect ──────
+
+function startWatchdog() {
+  if (_watchdogTimer) clearInterval(_watchdogTimer);
+
+  _watchdogTimer = setInterval(() => {
+    const idleMs  = Date.now() - _lastEventAt;
+    const idleMins = Math.round(idleMs / 60_000);
+    console.log(
+      `[mmi-pusher] heartbeat — stream=${_stream ? 'open' : 'null'} ` +
+      `idle=${idleMins}m in-flight=${_activeOps}`
+    );
+
+    if (!_stream && !_reconnecting) {
+      console.warn('[mmi-pusher] Watchdog: no stream — forcing reconnect.');
+      scheduleReconnect(0);
       return;
     }
 
-    console.warn(
-      `[mmi-pusher] IMEI=${imei} → HTTP ${res.status}: ${JSON.stringify(res.data)}`
-    );
-    return;
-  }
+    if (_stream && idleMs > STALE_STREAM_MS) {
+      console.warn(
+        `[mmi-pusher] Watchdog: stream idle for ${idleMins} min — closing and reconnecting.`
+      );
+      const dying = _stream;
+      _stream = null;
+      dying.close().catch(() => {});
+      scheduleReconnect(0);
+    }
+  }, WATCHDOG_INTERVAL);
+}
+
+function scheduleReconnect(delayMs = 5_000) {
+  if (_reconnecting) return;
+  _reconnecting = true;
+  setTimeout(() => {
+    _reconnecting = false;
+    open();
+  }, delayMs);
 }
 
 // ── Change stream ─────────────────────────────────────────────────────────────
 
 function open() {
+  if (_stream) return; // already open
+
+  if (mongoose.connection.readyState !== 1) {
+    console.warn('[mmi-pusher] MongoDB not ready — waiting for connection before opening stream.');
+    mongoose.connection.once('connected', open);
+    return;
+  }
+
   const coll = mongoose.connection.collection('ais140locations');
 
   _stream = coll.watch(
@@ -133,7 +174,11 @@ function open() {
     { fullDocument: 'default' }
   );
 
+  _lastEventAt = Date.now(); // reset idle clock on fresh open
+
   _stream.on('change', async (event) => {
+    _lastEventAt = Date.now();
+
     const doc  = event.fullDocument;
     if (!doc) return;
 
@@ -144,14 +189,18 @@ function open() {
 
     // Skip packets with no valid GPS fix
     if (!doc.gpsValid || doc.latitude == null || doc.longitude == null) {
-      console.log(
-        `[mmi-pusher] IMEI=${imei} packetType=${doc.packetType || '?'} — no GPS fix, skipped.`
+      return;
+    }
+
+    // Shed load when too many pushes are already in-flight
+    if (_activeOps >= MAX_CONCURRENT_PUSH) {
+      console.warn(
+        `[mmi-pusher] IMEI=${imei} dropped — ${_activeOps} pushes already in-flight (backpressure).`
       );
       return;
     }
 
     const payload = buildPayload(doc);
-    console.log(`[mmi-pusher] IMEI=${imei} push body: ${JSON.stringify(payload)}`);
 
     pushToMMI(imei, payload).catch(err =>
       console.error(`[mmi-pusher] Unexpected error for IMEI=${imei}:`, err.message)
@@ -161,13 +210,13 @@ function open() {
   _stream.on('error', (err) => {
     console.error('[mmi-pusher] Change stream error:', err.message);
     _stream = null;
-    setTimeout(open, 5_000);
+    scheduleReconnect(5_000);
   });
 
   _stream.on('close', () => {
     console.warn('[mmi-pusher] Stream closed — reconnecting in 5 s…');
     _stream = null;
-    setTimeout(open, 5_000);
+    scheduleReconnect(5_000);
   });
 
   console.log('[mmi-pusher] Watching ais140locations for GPS inserts…');
@@ -181,9 +230,14 @@ async function start() {
   } else {
     open();
   }
+  startWatchdog();
 }
 
 async function stop() {
+  if (_watchdogTimer) {
+    clearInterval(_watchdogTimer);
+    _watchdogTimer = null;
+  }
   if (_stream) {
     await _stream.close().catch(() => {});
     _stream = null;
