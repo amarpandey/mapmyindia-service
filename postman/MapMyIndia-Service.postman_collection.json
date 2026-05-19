@@ -1,0 +1,174 @@
+{
+  "info": {
+    "name": "MapMyIndia Service - Mappls IoT Push",
+    "description": "Tests the same Mappls APIs that the mapmyindia-service uses: OAuth token + GPS pushData. Pass your IMEI via the {{imei}} collection variable.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "mmi_client_id",
+      "value": "96dHZVzsAuvXO9LXDYa-OG8E8EgZVOeJQHkLNOxkF9ZhqZQMDcTvEUDTTHCQuKQgJHltjZ96XzRwHtE9pZRk7LtDs19fRBRZ",
+      "description": "Mappls client_id (from .env MMI_CLIENT_ID)"
+    },
+    {
+      "key": "mmi_client_secret",
+      "value": "lrFxI-iSEg9Vx9bwThXNh9IpNOM8ZS-iKVGVzTr8WGOUq77CFJu6Yt6O1NRl3wVonrULzvT-d6k6MilkrmB6baSgrBsrmU2fmhN5ES8aQHM=",
+      "description": "Mappls client_secret (from .env MMI_CLIENT_SECRET)"
+    },
+    {
+      "key": "imei",
+      "value": "123456789012345",
+      "description": "Device IMEI used as trackingCode header"
+    },
+    {
+      "key": "access_token",
+      "value": "",
+      "description": "Auto-populated by '1. Get OAuth Token' request"
+    },
+    {
+      "key": "latitude",
+      "value": "28.6139",
+      "description": "Sample latitude (defaults to Delhi)"
+    },
+    {
+      "key": "longitude",
+      "value": "77.2090",
+      "description": "Sample longitude (defaults to Delhi)"
+    },
+    {
+      "key": "speed",
+      "value": "45",
+      "description": "Sample speed in km/h"
+    },
+    {
+      "key": "heading",
+      "value": "90",
+      "description": "Sample heading 0-359"
+    },
+    {
+      "key": "ignition",
+      "value": "1",
+      "description": "1 = ON, 0 = OFF"
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Get OAuth Token",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Status is 200', () => pm.response.to.have.status(200));",
+              "const json = pm.response.json();",
+              "pm.test('access_token present', () => pm.expect(json.access_token).to.be.a('string'));",
+              "pm.collectionVariables.set('access_token', json.access_token);",
+              "console.log('Token saved. Expires in ' + json.expires_in + 's');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/x-www-form-urlencoded"
+          }
+        ],
+        "url": {
+          "raw": "https://outpost.mappls.com/api/security/oauth/token?grant_type=client_credentials&client_id={{mmi_client_id}}&client_secret={{mmi_client_secret}}",
+          "protocol": "https",
+          "host": ["outpost", "mappls", "com"],
+          "path": ["api", "security", "oauth", "token"],
+          "query": [
+            { "key": "grant_type", "value": "client_credentials" },
+            { "key": "client_id", "value": "{{mmi_client_id}}" },
+            { "key": "client_secret", "value": "{{mmi_client_secret}}" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "2. Push GPS Data (for {{imei}})",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const now = Math.floor(Date.now() / 1000);",
+              "pm.variables.set('ts_now', now);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('Push accepted (2xx)', () => pm.expect(pm.response.code).to.be.within(200, 299));",
+              "if (pm.response.code === 401) console.warn('Token expired — re-run \"1. Get OAuth Token\"');",
+              "if (pm.response.code === 403) console.warn('IMEI not registered on Mappls. Register it in the Mappls dashboard.');",
+              "if (pm.response.code === 429) console.warn('Rate limited — reduce push frequency.');"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "trackingCode", "value": "{{imei}}" },
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "Cookie", "value": "HttpOnly" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "[\n  {\n    \"timestamp\": {{ts_now}},\n    \"insertTime\": {{ts_now}},\n    \"longitude\": {{longitude}},\n    \"latitude\": {{latitude}},\n    \"heading\": {{heading}},\n    \"speed\": {{speed}},\n    \"ignition\": {{ignition}},\n    \"gpsOdometer\": 12345,\n    \"numberOfSatellites\": 8\n  }\n]"
+        },
+        "url": {
+          "raw": "https://intouch.mapmyindia.com/iot/api/events/pushData/",
+          "protocol": "https",
+          "host": ["intouch", "mapmyindia", "com"],
+          "path": ["iot", "api", "events", "pushData", ""]
+        }
+      }
+    },
+    {
+      "name": "3. Push GPS Data - Custom Coordinates",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const now = Math.floor(Date.now() / 1000);",
+              "pm.variables.set('ts_now', now);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Authorization", "value": "Bearer {{access_token}}" },
+          { "key": "trackingCode", "value": "{{imei}}" },
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "[\n  {\n    \"timestamp\": {{ts_now}},\n    \"insertTime\": {{ts_now}},\n    \"longitude\": 77.2090,\n    \"latitude\": 28.6139,\n    \"heading\": 90,\n    \"speed\": 45,\n    \"ignition\": 1\n  }\n]"
+        },
+        "url": {
+          "raw": "https://intouch.mapmyindia.com/iot/api/events/pushData/",
+          "protocol": "https",
+          "host": ["intouch", "mapmyindia", "com"],
+          "path": ["iot", "api", "events", "pushData", ""]
+        },
+        "description": "Edit the raw body to send custom lat/lng/speed for a one-off test."
+      }
+    }
+  ]
+}
